@@ -3,5 +3,4 @@ Experiments in hardware-accelerated rendering of optical illusions requiring fra
 This requires a 120 Hz display.
 
 
-
-PHOTOSENSITIVE SEIZURE WARNING
+FLASH WARNING
