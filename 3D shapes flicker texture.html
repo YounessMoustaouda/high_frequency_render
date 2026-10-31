@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>flickering grid · 3D texture · many objects</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0e14; overflow: hidden;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  canvas { display: block; }
+
+  #ui {
+    position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+    display: flex; gap: 20px; align-items: center; flex-wrap: wrap;
+    justify-content: center; max-width: calc(100vw - 24px);
+    padding: 11px 18px; border-radius: 12px;
+    background: rgba(17, 22, 31, 0.78);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    -webkit-backdrop-filter: blur(8px);
+    backdrop-filter: blur(8px);
+    color: #cfd6e4; font-size: 12px; letter-spacing: 0.02em;
+    user-select: none; z-index: 10;
+  }
+  .ctl { display: flex; align-items: center; gap: 8px; }
+  .ctl label { text-transform: uppercase; font-size: 10px; letter-spacing: .12em; opacity: .7; }
+  .val { min-width: 1.6em; text-align: right; font-variant-numeric: tabular-nums; color: #8fb6ff; }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none;
+    width: 110px; height: 3px; border-radius: 2px;
+    background: rgba(255, 255, 255, .18); outline: none; cursor: pointer;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 13px; height: 13px; border-radius: 50%;
+    background: #7fb0ff; box-shadow: 0 0 0 3px rgba(127, 176, 255, .18);
+  }
+  input[type=range]::-moz-range-thumb {
+    width: 13px; height: 13px; border: 0; border-radius: 50%; background: #7fb0ff;
+  }
+
+  .sep { width: 1px; height: 22px; background: rgba(255, 255, 255, .12); }
+
+  button {
+    font: inherit; font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+    color: #cfd6e4; background: rgba(255, 255, 255, .06);
+    border: 1px solid rgba(255, 255, 255, .12); border-radius: 8px;
+    padding: 7px 11px; cursor: pointer;
+    transition: background .15s, border-color .15s, color .15s;
+  }
+  button:hover { background: rgba(255, 255, 255, .13); }
+  button.on {
+    background: rgba(127, 176, 255, .18);
+    border-color: rgba(127, 176, 255, .55);
+    color: #a9c8ff;
+  }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <div class="ctl" id="ctlCols">
+    <label for="cols">Horizontal</label>
+    <input id="cols" type="range" min="1" max="64" step="1" value="6">
+    <span class="val" id="colsVal">6</span>
+  </div>
+  <div class="ctl" id="ctlRows">
+    <label for="rows">Vertical</label>
+    <input id="rows" type="range" min="1" max="64" step="1" value="6">
+    <span class="val" id="rowsVal">6</span>
+  </div>
+
+  <div class="sep"></div>
+
+  <button id="pauseBtn" type="button" aria-pressed="false"
+          title="Freeze the movement of the 3D objects and camera">Pause motion</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* ================================================================== */
+/*  renderer                                                          */
+/* ================================================================== */
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+/* ================================================================== */
+/*  1. the flickering grid  ->  rendered into a texture               */
+/* ================================================================== */
+const RT_SIZE = 1024;
+
+const gridRT = new THREE.WebGLRenderTarget(RT_SIZE, RT_SIZE, {
+  minFilter: THREE.LinearMipmapLinearFilter,
+  magFilter: THREE.LinearFilter,
+  wrapS: THREE.RepeatWrapping,
+  wrapT: THREE.RepeatWrapping,
+  generateMipmaps: true,
+  depthBuffer: false,
+  stencilBuffer: false
+});
+gridRT.texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+// colour space stays "none": the shader writes LINEAR values into the target,
+// so sampling it as a map needs no extra decode and the final sRGB output
+// conversion gives back exactly the colours of the original 2D version.
+
+const gridUniforms = {
+  uResolution: { value: new THREE.Vector2(RT_SIZE, RT_SIZE) },
+  uCols:       { value: 6 },
+  uRows:       { value: 6 },
+  uStep:       { value: 0.0 }
+};
+
+const gridFragmentShader = /* glsl */`
+  precision highp float;
+
+  uniform vec2  uResolution;
+  uniform float uCols;
+  uniform float uRows;
+  uniform float uStep;
+
+  float hue2rgb(float p, float q, float t) {
+    t = fract(t);
+    if (t < 1.0 / 6.0) return p + (q - p) * 6.0 * t;
+    if (t < 0.5)       return q;
+    if (t < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+    return p;
+  }
+
+  // h, s, l in [0,1] — matches hslToRgbString(h, 90%, 58%)
+  vec3 hsl2rgb(float h, float s, float l) {
+    float q = (l < 0.5) ? l * (1.0 + s) : l + s - l * s;
+    float p = 2.0 * l - q;
+    return vec3(
+      hue2rgb(p, q, h + 1.0 / 3.0),
+      hue2rgb(p, q, h),
+      hue2rgb(p, q, h - 1.0 / 3.0)
+    );
+  }
+
+  vec3 srgbToLinear(vec3 c) {
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+  }
+
+  void main() {
+    vec2  res = uResolution;
+    float m   = min(res.x, res.y);                 // shorter side = logical unit
+    vec2  p   = (gl_FragCoord.xy - 0.5 * res) / m; // centred, spans [-0.5, 0.5]
+    float px  = 1.0 / m;
+
+    // the render target is square -> the grid always fills it completely
+    float halfX = 0.5;
+    float halfY = 0.5;
+
+    /* ---------- background + radial glow ---------- */
+    vec3  col   = vec3(0.0667, 0.0863, 0.1216);    // #11161f
+    float d     = length(p);
+    float gBase = 0.5;
+    float gIn   = gBase * 0.222;
+    float gOut  = gBase * 2.0;
+    float g     = 1.0 - clamp((d - gIn) / (gOut - gIn), 0.0, 1.0);
+    col = mix(col, vec3(0.3137, 0.5490, 1.0), 0.10 * g);
+
+    /* ---------- grid mask ---------- */
+    vec2  q      = abs(p) - vec2(halfX, halfY);
+    float sd     = max(q.x, q.y);
+    float inside = 1.0 - smoothstep(-px, px, sd);
+
+    /* ---------- normalised coords across the grid ---------- */
+    float tx = (p.x + halfX) / (2.0 * halfX);
+    float ty = (p.y + halfY) / (2.0 * halfY);
+
+    /* ---------- two-colour checkerboard ---------- */
+    float cx   = floor(tx * uCols);
+    float cy   = floor(ty * uRows);
+    float ci   = mod(cx + cy + uStep, 2.0);
+    vec3  cell = hsl2rgb(ci * 0.5, 0.9, 0.58);
+    col = mix(col, cell, inside);
+
+    /* ---------- divider lines ---------- */
+    float sx  = tx * uCols;
+    float kx  = floor(sx + 0.5);
+    float dx  = abs(sx - kx) * (2.0 * halfX / uCols);
+    float onx = step(0.5, kx) * step(kx, uCols - 0.5);
+
+    float sy  = ty * uRows;
+    float ky  = floor(sy + 0.5);
+    float dy  = abs(sy - ky) * (2.0 * halfY / uRows);
+    float ony = step(0.5, ky) * step(ky, uRows - 0.5);
+
+    float dl = min(mix(1e9, dx, onx), mix(1e9, dy, ony));
+    float lw = max(0.001, px);
+    float lm = (1.0 - smoothstep(lw - px, lw + px, dl)) * inside;
+    col = mix(col, vec3(0.0), 0.10 * lm);
+
+    /* ---------- border ---------- */
+    float bw = max(0.002, 2.0 * px);
+    float bm = 1.0 - smoothstep(bw - px, bw + px, abs(sd));
+    col = mix(col, vec3(1.0), 0.18 * bm);
+
+    /* ---------- store as LINEAR (the texture is sampled as albedo) ---------- */
+    gl_FragColor = vec4(srgbToLinear(clamp(col, 0.0, 1.0)), 1.0);
+  }
+`;
+
+const gridScene  = new THREE.Scene();
+const gridCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+const gridMaterial = new THREE.ShaderMaterial({
+  uniforms: gridUniforms,
+  vertexShader: /* glsl */`
+    void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }
+  `,
+  fragmentShader: gridFragmentShader,
+  depthTest: false,
+  depthWrite: false
+});
+
+const gridQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), gridMaterial);
+gridQuad.frustumCulled = false;
+gridScene.add(gridQuad);
+
+const gridTexture = gridRT.texture;
+
+/* ================================================================== */
+/*  2. the 3D scene that wears the texture                            */
+/* ================================================================== */
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0e14);
+scene.fog = new THREE.FogExp2(0x0b0e14, 0.022);
+
+const camera = new THREE.PerspectiveCamera(
+  50, window.innerWidth / window.innerHeight, 0.1, 200
+);
+camera.position.set(0, 3, 17);
+
+/* ---------- lights ---------- */
+scene.add(new THREE.HemisphereLight(0x9fb8ff, 0x0a0d14, 0.9));
+
+const keyLight = new THREE.DirectionalLight(0xffffff, 2.0);
+keyLight.position.set(6, 10, 8);
+scene.add(keyLight);
+
+const rimA = new THREE.PointLight(0x4d8cff, 260, 0, 2);
+rimA.position.set(-11, 7, 9);
+scene.add(rimA);
+
+const rimB = new THREE.PointLight(0xff5aa0, 200, 0, 2);
+rimB.position.set(11, -8, -7);
+scene.add(rimB);
+
+/* ---------- shared materials ---------- */
+const MATERIALS = [
+  { roughness: 0.30, metalness: 0.00, emissiveIntensity: 0.30 },
+  { roughness: 0.62, metalness: 0.05, emissiveIntensity: 0.20 },
+  { roughness: 0.16, metalness: 0.28, emissiveIntensity: 0.35 },
+  { roughness: 0.85, metalness: 0.00, emissiveIntensity: 0.15 }
+].map(cfg => new THREE.MeshStandardMaterial({
+  map: gridTexture,
+  emissive: 0xffffff,
+  emissiveMap: gridTexture,
+  emissiveIntensity: cfg.emissiveIntensity,
+  roughness: cfg.roughness,
+  metalness: cfg.metalness
+}));
+
+/* ---------- geometries ---------- */
+const GEOMETRIES = [
+  new THREE.IcosahedronGeometry(1, 0),
+  new THREE.BoxGeometry(1.35, 1.35, 1.35),
+  new THREE.TorusGeometry(0.80, 0.30, 20, 48),
+  new THREE.TorusKnotGeometry(0.62, 0.21, 96, 16),
+  new THREE.SphereGeometry(0.90, 32, 24),
+  new THREE.ConeGeometry(0.78, 1.50, 6),
+  new THREE.OctahedronGeometry(0.95),
+  new THREE.DodecahedronGeometry(0.88),
+  new THREE.CylinderGeometry(0.62, 0.62, 1.40, 24),
+  new THREE.TetrahedronGeometry(1.05),
+  new THREE.TorusGeometry(0.85, 0.28, 16, 6),
+  new THREE.IcosahedronGeometry(0.95, 1)
+];
+
+/* ---------- helpers ---------- */
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+function randomInShell(minR, maxR) {
+  const theta = Math.random() * Math.PI * 2;
+  const phi   = Math.acos(2 * Math.random() - 1);
+  const r     = rnd(minR, maxR);
+  return new THREE.Vector3(
+    r * Math.sin(phi) * Math.cos(theta),
+    r * Math.cos(phi) * 0.72,          // slightly squashed cloud
+    r * Math.sin(phi) * Math.sin(theta)
+  );
+}
+
+/* ---------- populate ---------- */
+const OBJECT_COUNT = 46;
+const objects = [];
+
+for (let i = 0; i < OBJECT_COUNT; i++) {
+  const geo  = GEOMETRIES[i % GEOMETRIES.length];
+  const mat  = MATERIALS[i % MATERIALS.length];
+  const mesh = new THREE.Mesh(geo, mat);
+
+  const pos = randomInShell(2.2, 10.5);
+  mesh.position.copy(pos);
+  mesh.scale.setScalar(rnd(0.45, 1.50));
+  mesh.rotation.set(rnd(0, 6.283), rnd(0, 6.283), rnd(0, 6.283));
+
+  mesh.userData = {
+    base: pos.clone(),
+    amp:  new THREE.Vector3(rnd(0.30, 1.40), rnd(0.30, 1.60), rnd(0.30, 1.40)),
+    spd:  new THREE.Vector3(rnd(0.06, 0.22), rnd(0.08, 0.26), rnd(0.06, 0.22)),
+    ph:   new THREE.Vector3(rnd(0, 6.283), rnd(0, 6.283), rnd(0, 6.283)),
+    rot:  new THREE.Vector3(rnd(-0.25, 0.25), rnd(-0.35, 0.35), rnd(-0.22, 0.22))
+  };
+
+  scene.add(mesh);
+  objects.push(mesh);
+}
+
+/* ================================================================== */
+/*  3. resize                                                         */
+/* ================================================================== */
+function onResize() {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth / Math.max(1, window.innerHeight);
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', onResize);
+
+/* ================================================================== */
+/*  4. UI                                                             */
+/* ================================================================== */
+const colsEl    = document.getElementById('cols');
+const rowsEl    = document.getElementById('rows');
+const colsVal   = document.getElementById('colsVal');
+const rowsVal   = document.getElementById('rowsVal');
+const ctlCols   = document.getElementById('ctlCols');
+const ctlRows   = document.getElementById('ctlRows');
+const pauseBtn  = document.getElementById('pauseBtn');
+
+const MIN = 1;
+const MAX = 64;
+const clamp = v => Math.min(MAX, Math.max(MIN, v));
+
+function writeCols(v) {
+  v = clamp(v);
+  colsEl.value = v;
+  gridUniforms.uCols.value = v;
+  colsVal.textContent = v;
+}
+function writeRows(v) {
+  v = clamp(v);
+  rowsEl.value = v;
+  gridUniforms.uRows.value = v;
+  rowsVal.textContent = v;
+}
+
+colsEl.addEventListener('input', () => writeCols(parseInt(colsEl.value, 10)));
+rowsEl.addEventListener('input', () => writeRows(parseInt(rowsEl.value, 10)));
+writeCols(parseInt(colsEl.value, 10));
+writeRows(parseInt(rowsEl.value, 10));
+
+/* ---------- mousewheel on the slider groups ---------- */
+function attachWheel(container, input, write) {
+  container.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const dir = -Math.sign(e.deltaY);              // wheel up → increase
+    if (!dir) return;
+    const cur  = Number(input.value);
+    const next = clamp(cur + dir * (Number(input.step) || 1));
+    if (next === cur) return;
+    write(next);
+  }, { passive: false });
+}
+attachWheel(ctlCols, colsEl, writeCols);
+attachWheel(ctlRows, rowsEl, writeRows);
+
+/* ---------- pause motion ---------- */
+let paused = false;
+pauseBtn.addEventListener('click', () => {
+  paused = !paused;
+  pauseBtn.classList.toggle('on', paused);
+  pauseBtn.setAttribute('aria-pressed', String(paused));
+  pauseBtn.textContent = paused ? 'Resume motion' : 'Pause motion';
+});
+
+/* ================================================================== */
+/*  5. loop                                                           */
+/* ================================================================== */
+let last = performance.now();
+let t = 0;                       // scene time (frozen while paused)
+let step = 0;                    // checkerboard phase: 0 → 1 → 0 …
+
+function updateObjects(dt) {
+  for (let i = 0; i < objects.length; i++) {
+    const o = objects[i];
+    const u = o.userData;
+
+    o.position.set(
+      u.base.x + Math.sin(t * u.spd.x + u.ph.x) * u.amp.x,
+      u.base.y + Math.sin(t * u.spd.y + u.ph.y) * u.amp.y,
+      u.base.z + Math.sin(t * u.spd.z + u.ph.z) * u.amp.z
+    );
+
+    o.rotation.x += u.rot.x * dt;
+    o.rotation.y += u.rot.y * dt;
+    o.rotation.z += u.rot.z * dt;
+  }
+}
+
+function updateCamera() {
+  const R = 17;
+  camera.position.set(
+    Math.sin(t * 0.070) * R,
+    Math.sin(t * 0.050) * 5.0,
+    Math.cos(t * 0.070) * R
+  );
+  camera.lookAt(0, 0, 0);
+}
+
+function animate(now) {
+  requestAnimationFrame(animate);
+
+  const dt = Math.min(0.05, (now - last) / 1000) || 0;
+  last = now;
+
+  if (!paused) t += dt;
+
+  /* ---- flicker: swap the two colours once per rendered frame ---- */
+  /* (one flip per requestAnimationFrame -> locked to the display  */
+  /*  refresh rate, the fastest a monitor can show)                */
+  step = 1 - step;
+  gridUniforms.uStep.value = step;
+
+  /* ---- slow 3D movement ---- */
+  updateObjects(paused ? 0 : dt);
+  updateCamera();
+
+  /* ---- pass 1 : draw the flickering grid into the texture ---- */
+  renderer.setRenderTarget(gridRT);
+  renderer.render(gridScene, gridCamera);
+
+  /* ---- pass 2 : draw the objects wearing that texture ---- */
+  renderer.setRenderTarget(null);
+  renderer.render(scene, camera);
+}
+
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>

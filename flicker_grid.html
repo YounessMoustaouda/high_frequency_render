@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>color cycling grid · 2 colors · fits screen</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0e14; overflow: hidden;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  canvas { display: block; }
+
+  #ui {
+    position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+    display: flex; gap: 20px; align-items: center; flex-wrap: wrap;
+    justify-content: center; max-width: calc(100vw - 24px);
+    padding: 11px 18px; border-radius: 12px;
+    background: rgba(17, 22, 31, 0.78);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    -webkit-backdrop-filter: blur(8px);
+    backdrop-filter: blur(8px);
+    color: #cfd6e4; font-size: 12px; letter-spacing: 0.02em;
+    user-select: none; z-index: 10;
+  }
+  .ctl { display: flex; align-items: center; gap: 8px; }
+  .ctl label { text-transform: uppercase; font-size: 10px; letter-spacing: .12em; opacity: .7; }
+  .val { min-width: 1.6em; text-align: right; font-variant-numeric: tabular-nums; color: #8fb6ff; }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none;
+    width: 110px; height: 3px; border-radius: 2px;
+    background: rgba(255, 255, 255, .18); outline: none; cursor: pointer;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 13px; height: 13px; border-radius: 50%;
+    background: #7fb0ff; box-shadow: 0 0 0 3px rgba(127, 176, 255, .18);
+  }
+  input[type=range]::-moz-range-thumb {
+    width: 13px; height: 13px; border: 0; border-radius: 50%; background: #7fb0ff;
+  }
+
+  .sep { width: 1px; height: 22px; background: rgba(255, 255, 255, .12); }
+
+  button {
+    font: inherit; font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+    color: #cfd6e4; background: rgba(255, 255, 255, .06);
+    border: 1px solid rgba(255, 255, 255, .12); border-radius: 8px;
+    padding: 7px 11px; cursor: pointer;
+    transition: background .15s, border-color .15s, color .15s;
+  }
+  button:hover { background: rgba(255, 255, 255, .13); }
+  button.on {
+    background: rgba(127, 176, 255, .18);
+    border-color: rgba(127, 176, 255, .55);
+    color: #a9c8ff;
+  }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <div class="ctl" id="ctlCols">
+    <label for="cols">Horizontal</label>
+    <input id="cols" type="range" min="1" max="320" step="1" value="2">
+    <span class="val" id="colsVal">2</span>
+  </div>
+  <div class="ctl" id="ctlRows">
+    <label for="rows">Vertical</label>
+    <input id="rows" type="range" min="1" max="320" step="1" value="1">
+    <span class="val" id="rowsVal">1</span>
+  </div>
+
+  <div class="sep"></div>
+
+  <button id="squareBtn" type="button" aria-pressed="false"
+          title="Keep grid cells as square as possible">Square</button>
+  <button id="fillBtn" type="button" aria-pressed="false"
+          title="Make the grid fill the whole screen">Fill screen</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* ------------------------------------------------------------------ */
+/*  renderer                                                           */
+/* ------------------------------------------------------------------ */
+const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const scene  = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+/* ------------------------------------------------------------------ */
+/*  shader                                                             */
+/* ------------------------------------------------------------------ */
+const FILL = 0.98;   // square fills the shorter screen axis (small margin)
+
+const uniforms = {
+  uResolution: { value: new THREE.Vector2(1, 1) },
+  uCols:       { value: 2 },   // horizontal divisions (columns)
+  uRows:       { value: 1 },   // vertical divisions (rows)
+  uFill:       { value: FILL },
+  uStep:       { value: 0.0 },
+  uFullScreen: { value: 0.0 }  // 0 = square, 1 = fill the whole screen
+};
+
+const fragmentShader = /* glsl */`
+  precision highp float;
+
+  uniform vec2  uResolution;
+  uniform float uCols;
+  uniform float uRows;
+  uniform float uFill;
+  uniform float uStep;
+  uniform float uFullScreen;
+
+  float hue2rgb(float p, float q, float t) {
+    t = fract(t);
+    if (t < 1.0 / 6.0) return p + (q - p) * 6.0 * t;
+    if (t < 0.5)       return q;
+    if (t < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+    return p;
+  }
+
+  // h, s, l in [0,1] — matches hslToRgbString(h, 90%, 58%)
+  vec3 hsl2rgb(float h, float s, float l) {
+    float q = (l < 0.5) ? l * (1.0 + s) : l + s - l * s;
+    float p = 2.0 * l - q;
+    return vec3(
+      hue2rgb(p, q, h + 1.0 / 3.0),
+      hue2rgb(p, q, h),
+      hue2rgb(p, q, h - 1.0 / 3.0)
+    );
+  }
+
+  void main() {
+    vec2  res = uResolution;
+    float m   = min(res.x, res.y);                 // logical unit = shorter screen side
+    vec2  p   = (gl_FragCoord.xy - 0.5 * res) / m; // centred, shorter axis spans [-0.5, 0.5]
+    float px  = 1.0 / m;                           // one device pixel in p-units
+
+    /* ---------- half extents: square (fit) or full screen (fill) ---------- */
+    float halfX, halfY;
+    if (uFullScreen > 0.5) {
+      halfX = 0.5 * res.x / m;                     // grid covers the entire viewport
+      halfY = 0.5 * res.y / m;
+    } else {
+      halfX = 0.5 * uFill;                         // square always fits the screen
+      halfY = halfX;
+    }
+
+    /* ---------- background + radial glow (proportional to the square) ---------- */
+    vec3  col = vec3(0.0667, 0.0863, 0.1216);      // #11161f
+    float d   = length(p);
+    float gBase = min(halfX, halfY);
+    float gIn = gBase * 0.222;
+    float gOut= gBase * 2.0;
+    float g   = 1.0 - clamp((d - gIn) / (gOut - gIn), 0.0, 1.0);
+    col = mix(col, vec3(0.3137, 0.5490, 1.0), 0.10 * g);
+
+    /* ---------- grid mask (square or full-screen rectangle) ---------- */
+    vec2  q      = abs(p) - vec2(halfX, halfY);
+    float sd     = max(q.x, q.y);                  // signed distance to the bounds
+    float inside = 1.0 - smoothstep(-px, px, sd);
+
+    /* ---------- normalised coords across the grid ---------- */
+    float tx = (p.x + halfX) / (2.0 * halfX);      // 0..1 left  → right
+    float ty = (p.y + halfY) / (2.0 * halfY);      // 0..1 bottom → top
+
+    /* ---------- two-colour checkerboard ---------- */
+    float cx   = floor(tx * uCols);
+    float cy   = floor(ty * uRows);
+    float ci   = mod(cx + cy + uStep, 2.0);        // 0 or 1 → the two colours
+    vec3  cell = hsl2rgb(ci * 0.5, 0.9, 0.58);     // hue 0.0 and 0.5
+    col = mix(col, cell, inside);
+
+    /* ---------- divider lines (horizontal + vertical) ---------- */
+    float sx  = tx * uCols;
+    float kx  = floor(sx + 0.5);                              // nearest vertical divider
+    float dx  = abs(sx - kx) * (2.0 * halfX / uCols);
+    float onx = step(0.5, kx) * step(kx, uCols - 0.5);        // skip grid edges
+
+    float sy  = ty * uRows;
+    float ky  = floor(sy + 0.5);                              // nearest horizontal divider
+    float dy  = abs(sy - ky) * (2.0 * halfY / uRows);
+    float ony = step(0.5, ky) * step(ky, uRows - 0.5);
+
+    float dl = min(mix(1e9, dx, onx), mix(1e9, dy, ony));     // distance to nearest divider
+    float lw = max(0.001, px);
+    float lm = (1.0 - smoothstep(lw - px, lw + px, dl)) * inside;
+    col = mix(col, vec3(0.0), 0.10 * lm);
+
+    /* ---------- border ---------- */
+    float bw = max(0.002, 2.0 * px);
+    float bm = 1.0 - smoothstep(bw - px, bw + px, abs(sd));
+    col = mix(col, vec3(1.0), 0.25 * bm);
+
+    gl_FragColor = vec4(col, 1.0);
+  }
+`;
+
+const material = new THREE.ShaderMaterial({
+  uniforms,
+  vertexShader: /* glsl */`
+    void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }
+  `,
+  fragmentShader,
+  depthTest: false,
+  depthWrite: false
+});
+
+const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
+quad.frustumCulled = false;
+scene.add(quad);
+
+/* ------------------------------------------------------------------ */
+/*  resize                                                             */
+/* ------------------------------------------------------------------ */
+function resize() {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+  uniforms.uResolution.value.copy(size);
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ------------------------------------------------------------------ */
+/*  controls                                                           */
+/* ------------------------------------------------------------------ */
+const colsEl    = document.getElementById('cols');
+const rowsEl    = document.getElementById('rows');
+const colsVal   = document.getElementById('colsVal');
+const rowsVal   = document.getElementById('rowsVal');
+const ctlCols   = document.getElementById('ctlCols');
+const ctlRows   = document.getElementById('ctlRows');
+const squareBtn = document.getElementById('squareBtn');
+const fillBtn   = document.getElementById('fillBtn');
+
+const MIN = 1;
+const MAX = 320;
+
+let squareMode = false;
+
+const clamp = (v) => Math.min(MAX, Math.max(MIN, v));
+
+/* aspect ratio (width / height) of the grid drawing region */
+function regionAspect() {
+  if (uniforms.uFullScreen.value > 0.5) {
+    return window.innerWidth / Math.max(1, window.innerHeight);
+  }
+  return 1;                       // the fitted grid is always a square
+}
+
+/* given one axis, the value of the other axis that makes cells square */
+function partner(fromAxis, value) {
+  const a = regionAspect();
+  return fromAxis === 'cols'
+    ? clamp(Math.round(value / a))   // -> rows
+    : clamp(Math.round(value * a));  // -> cols
+}
+
+function writeCols(v) {
+  v = clamp(v);
+  colsEl.value = v;
+  uniforms.uCols.value = v;
+  colsVal.textContent = v;
+}
+function writeRows(v) {
+  v = clamp(v);
+  rowsEl.value = v;
+  uniforms.uRows.value = v;
+  rowsVal.textContent = v;
+}
+
+function syncCols() {
+  const v = parseInt(colsEl.value, 10);
+  writeCols(v);
+  if (squareMode) writeRows(partner('cols', v));
+}
+function syncRows() {
+  const v = parseInt(rowsEl.value, 10);
+  writeRows(v);
+  if (squareMode) writeCols(partner('rows', v));
+}
+
+colsEl.addEventListener('input', syncCols);
+rowsEl.addEventListener('input', syncRows);
+syncCols();
+syncRows();
+
+/* ---------- mousewheel on the slider groups ---------- */
+function attachWheel(container, input, sync) {
+  container.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const dir = -Math.sign(e.deltaY);          // wheel up → increase
+    if (!dir) return;
+    const cur  = Number(input.value);
+    const next = clamp(cur + dir * (Number(input.step) || 1));
+    if (next === cur) return;
+    input.value = next;
+    sync();
+  }, { passive: false });
+}
+attachWheel(ctlCols, colsEl, syncCols);
+attachWheel(ctlRows, rowsEl, syncRows);
+
+/* ---------- square button ---------- */
+squareBtn.addEventListener('click', () => {
+  squareMode = !squareMode;
+  squareBtn.classList.toggle('on', squareMode);
+  squareBtn.setAttribute('aria-pressed', String(squareMode));
+  if (squareMode) syncCols();   // keep horizontal count, adapt vertical to it
+});
+
+/* ---------- fill-screen button ---------- */
+fillBtn.addEventListener('click', () => {
+  const on = !(uniforms.uFullScreen.value > 0.5);
+  uniforms.uFullScreen.value = on ? 1.0 : 0.0;
+  fillBtn.classList.toggle('on', on);
+  fillBtn.setAttribute('aria-pressed', String(on));
+  if (squareMode) syncCols();   // re-derive the partner for the new region aspect
+});
+
+/* ---------- keep cells square across window resizes ---------- */
+window.addEventListener('resize', () => {
+  if (squareMode) syncCols();
+});
+
+/* ------------------------------------------------------------------ */
+/*  loop — one colour step per frame (locked to display refresh)       */
+/* ------------------------------------------------------------------ */
+let step = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  step = 1 - step;                 // 0 → 1 → 0 → 1 …  (swaps the two colours)
+  uniforms.uStep.value = step;
+
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>
